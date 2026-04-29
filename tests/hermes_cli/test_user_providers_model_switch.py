@@ -131,6 +131,55 @@ def test_list_authenticated_providers_enumerates_dict_format_models(monkeypatch)
     ]
 
 
+def test_list_authenticated_providers_uses_live_models_for_user_provider(monkeypatch):
+    """User-defined OpenAI-compatible providers should prefer live /models.
+
+    Regression: CRS-style providers with a stale config ``models:`` dict kept
+    showing only the configured subset in the /model picker, even though their
+    /v1/models endpoint exposed newly added models.
+    """
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr("hermes_cli.providers.HERMES_OVERLAYS", {})
+    monkeypatch.setenv("CRS_TEST_KEY", "sk-test")
+
+    calls = []
+
+    def fake_fetch_api_models(api_key, base_url):
+        calls.append((api_key, base_url))
+        return ["old-configured-model", "new-live-model"]
+
+    monkeypatch.setattr("hermes_cli.models.fetch_api_models", fake_fetch_api_models)
+
+    user_providers = {
+        "crs-henkee": {
+            "name": "CRS Henkee",
+            "base_url": "http://127.0.0.1:3000/api/v1",
+            "key_env": "CRS_TEST_KEY",
+            "model": "old-configured-model",
+            "models": {
+                "old-configured-model": {"context_length": 200000},
+            },
+        }
+    }
+
+    providers = list_authenticated_providers(
+        current_provider="crs-henkee",
+        user_providers=user_providers,
+        custom_providers=[],
+        max_models=50,
+    )
+
+    user_prov = next(
+        (p for p in providers if p.get("is_user_defined") and p["slug"] == "crs-henkee"),
+        None,
+    )
+
+    assert user_prov is not None
+    assert calls == [("sk-test", "http://127.0.0.1:3000/api/v1")]
+    assert user_prov["models"] == ["old-configured-model", "new-live-model"]
+    assert user_prov["total_models"] == 2
+
+
 def test_list_authenticated_providers_dict_models_without_default_model(monkeypatch):
     """Dict-format ``models:`` without a ``default_model`` must still expose
     every dict key, not collapse to an empty list."""
@@ -195,6 +244,58 @@ def test_list_authenticated_providers_dict_models_dedupe_with_default(monkeypatc
     assert user_prov is not None
     assert user_prov["total_models"] == 3
     assert user_prov["models"].count("model-a") == 1
+
+
+def test_openai_native_curated_catalog_is_non_empty():
+    """Regression: built-in openai must have a static catalog for picker totals."""
+    from hermes_cli.models import _PROVIDER_MODELS
+
+    assert _PROVIDER_MODELS.get("openai")
+    assert len(_PROVIDER_MODELS["openai"]) >= 4
+
+
+def test_list_authenticated_providers_openai_built_in_nonzero_total(monkeypatch):
+    """Built-in openai row must not report total_models=0 when creds exist."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setattr(
+        "agent.models_dev.fetch_models_dev",
+        lambda: {"openai": {"env": ["OPENAI_API_KEY"]}},
+    )
+    monkeypatch.setattr("hermes_cli.providers.HERMES_OVERLAYS", {})
+
+    providers = list_authenticated_providers(
+        current_provider="",
+        current_base_url="",
+        user_providers={},
+        custom_providers=[],
+        max_models=50,
+    )
+    row = next((p for p in providers if p.get("slug") == "openai"), None)
+    assert row is not None
+    assert row["total_models"] > 0
+
+
+def test_list_authenticated_providers_user_openai_official_url_fallback(monkeypatch):
+    """User providers: api.openai.com with no models list uses native curated fallback."""
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr("hermes_cli.providers.HERMES_OVERLAYS", {})
+
+    user_providers = {
+        "openai-direct": {
+            "name": "OpenAI Direct",
+            "api": "https://api.openai.com/v1",
+        }
+    }
+    providers = list_authenticated_providers(
+        current_provider="",
+        current_base_url="",
+        user_providers=user_providers,
+        custom_providers=[],
+        max_models=50,
+    )
+    row = next((p for p in providers if p.get("slug") == "openai-direct"), None)
+    assert row is not None
+    assert row["total_models"] > 0
 
 
 def test_list_authenticated_providers_fallback_to_default_only(monkeypatch):
@@ -302,6 +403,54 @@ def test_list_authenticated_providers_dedupes_when_user_and_custom_overlap(monke
     assert len(matches) == 1
     # providers: dict wins — legacy-only-model is suppressed.
     assert matches[0]["models"] == ["gpt-5.4", "grok-4.20-beta"]
+
+
+def test_list_authenticated_providers_no_duplicate_labels_across_schemas(monkeypatch):
+    """Regression: same endpoint in both ``providers:`` dict AND ``custom_providers:``
+    list (e.g. via ``get_compatible_custom_providers()``) must not emit two picker
+    rows with identical display names.
+
+    Before the fix, section 3 emitted bare-slug rows ("openrouter") and section 4
+    emitted ``custom:openrouter`` rows for the same endpoint — both labelled
+    identically, bypassing ``seen_slugs`` dedup because the slug shapes differ.
+    """
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr("hermes_cli.providers.HERMES_OVERLAYS", {})
+
+    shared_entries = [
+        ("endpoint-a", "http://a.local/v1"),
+        ("endpoint-b", "http://b.local/v1"),
+        ("endpoint-c", "http://c.local/v1"),
+    ]
+
+    user_providers = {
+        name: {"name": name, "base_url": url, "model": "m1"}
+        for name, url in shared_entries
+    }
+    custom_providers = [
+        {"name": name, "base_url": url, "model": "m1"}
+        for name, url in shared_entries
+    ]
+
+    providers = list_authenticated_providers(
+        current_provider="none",
+        user_providers=user_providers,
+        custom_providers=custom_providers,
+        max_models=50,
+    )
+
+    user_rows = [p for p in providers if p.get("source") == "user-config"]
+    # Expect one row per shared entry — not two.
+    assert len(user_rows) == len(shared_entries), (
+        f"Expected {len(shared_entries)} rows, got {len(user_rows)}: "
+        f"{[(p['slug'], p['name']) for p in user_rows]}"
+    )
+
+    # And zero duplicate display labels.
+    labels = [p["name"].lower() for p in user_rows]
+    assert len(labels) == len(set(labels)), (
+        f"Duplicate labels across picker rows: {labels}"
+    )
 
 
 # =============================================================================
