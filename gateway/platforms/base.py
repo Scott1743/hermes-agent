@@ -1355,6 +1355,8 @@ class BasePlatformAdapter(ABC):
         _LOCAL_MEDIA_EXTS = (
             '.png', '.jpg', '.jpeg', '.gif', '.webp',
             '.mp4', '.mov', '.avi', '.mkv', '.webm',
+            '.docx', '.doc', '.xlsx', '.xls', '.pptx', '.ppt',
+            '.pdf', '.txt', '.csv', '.zip', '.rar',
         )
         ext_part = '|'.join(e.lstrip('.') for e in _LOCAL_MEDIA_EXTS)
 
